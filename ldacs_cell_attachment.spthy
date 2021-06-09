@@ -1,0 +1,329 @@
+///////////////////////////////////////////////////////
+//
+//  LDACS SIGMA Protocol Model
+//
+//
+//  (c)DLR e.V. 2021
+//  TBD@dlr.de
+//
+///////////////////////////////////////////////////////
+
+theory ldacs_sigma
+begin
+
+builtins: diffie-hellman, symmetric-encryption, signing, hashing
+
+functions: kdf/2, hmac/2
+
+/////////////////////////////////////
+// Public key infrastructure (PKI)
+////////////////////////////////////
+
+// Anyone can register at any time a public key together with its ID
+// But: only once per ID
+rule Register_pk:
+  [ Fr(~ltkX) ]
+  --[ OnlyOnceV($X) ]->
+  [
+    !Ltk($X, ~ltkX)
+    , !Pk($X, pk(~ltkX))
+    , Out(pk(~ltkX)) 
+  ] 
+
+rule CA_init:
+    [ Fr(~ltk) ]
+    --[ OnlyOnce() ]->
+    [
+        !LtkCA(~ltk)
+        , !PkCA(pk(~ltk))
+        , Out(pk(~ltk)) 
+    ] 
+
+/////////////////////////////////////
+// Attacker
+//////////////
+
+// Compromising an agent's long-term key
+rule Reveal_ltk:
+  [ !Ltk($X, ltkX) ] --[ Corrupted($X) ]-> [ Out(ltkX) ]
+
+/////////////////////////////////////
+// Protocol Role Script Start
+////////////////
+
+rule AS_0:
+    [ 
+        Fr(~sid) //AS session id
+        , !Ltk($UAas, ltkAS)
+    ]
+    --[ CreateA($UAas, ~sid) ]->
+    [
+        S_AS_0($UAas, ~sid, ltkAS) 
+    ]
+
+rule GS_0:
+    let mPubKeyGS = h(pk(ltkGS))
+    in
+    [ 
+        Fr(~sid) //GS session id
+        , Fr(~SACgs)
+        , !Ltk($UAgs, ltkGS) //get own private key
+    ]
+    --[ CreateG($UAgs, ~sid) ]->
+    [ 
+        S_GS_0($UAgs, ~SACgs, ~sid, ltkGS)
+        , Out(<'SIB', $UAgs, ~SACgs, mPubKeyGS>)
+    ]
+
+// case a): AS already has the Certificate from GS
+rule AS_1_a:
+    [   
+        S_AS_0(UAas, sid, ltkAS)
+        , In(<'SIB', UAgs, SACgs, mPubKeyGS>)
+        , !Pk(UAgs, pkGS)    
+    ]
+    --[ Eq(h(pkGS), mPubKeyGS), AttachingWCert(UAas, UAgs, sid), Neq(UAas, UAgs) ]->
+    [
+        Out(<'CellEntryRequest', UAas, SACgs, 'cert_status'>)
+        , S_AS_1(UAas, UAgs, SACgs, sid, ltkAS, mPubKeyGS)
+        , S_AS_has_cert(UAas, UAgs, sid)
+    ]
+
+// case b): AS does not have the Certificate from GS
+rule AS_1_b:
+    [   
+        S_AS_0(UAas, sid, ltkAS)
+        , In(<'SIB', UAgs, SACgs, mPubKeyGS>)
+    ]
+    --[ AttachingNoCert(UAas, UAgs, sid), Neq(UAas, UAgs) ]->
+    [
+        Out(<'CellEntryRequest', UAas, SACgs, 'cert_status'>)
+        , S_AS_1(UAas, UAgs, SACgs, sid, ltkAS, mPubKeyGS)
+        , S_AS_needs_cert(UAas, UAgs, sid)
+    ]
+
+rule GS_1:
+    [
+        S_GS_0(UAgs, SACgs, sid, ltkGS)
+        , In(<'CellEntryRequest', UAas, SACgs, 'cert_status'>)
+        , Fr(~SACas)
+        , Fr(~Ngs)
+        , Fr(~EpLDACS)
+    ]
+    -->
+    [
+        Out(<'CellEntryResponse', ~SACas, ~EpLDACS, 'CC_LDACS', ~Ngs>)
+        , S_GS_1(UAgs, SACgs, sid, ltkGS, UAas, ~SACas, ~Ngs, ~EpLDACS)
+    ]
+
+rule AS_2:
+    let tas = 'g'^~y
+    in
+    [   
+        S_AS_1(UAas, UAgs, SACgs, sid, ltkAS, mPubKeyGS)
+        , In(<'CellEntryResponse', SACas, EpLDACS, 'CC_LDACS', Ngs>)        
+        , Fr(~y)
+        , Fr(~Nas)
+        , Fr(~algo)
+    ]
+    --[ Running(UAas, UAgs, sid, tas) ]-> 
+    [ 
+        Out(<~algo, ~Nas, tas, Ngs>)
+        , S_AS_2(UAas, UAgs, SACgs, sid, ltkAS, mPubKeyGS, SACas, EpLDACS, Ngs, tas, ~y, ~Nas, ~algo)
+    ]
+
+rule GS_2:
+    let tgs = 'g'^~x
+        sOCSPgs = sign(<UAgs, pk(ltkGS)>, ltkCA) //get signed pubKey of GS
+    in
+    [   S_GS_1(UAgs, SACgs, sid, ltkGS, UAas, SACas, Ngs, EpLDACS)
+        , In(<algo, Nas, tas, Ngs>)
+        , Fr(~x)
+        , !LtkCA(ltkCA)
+    ]     
+    --[ CheckG1(UAgs, sid) ]->
+    [ 
+        S_GS_2(UAgs, SACgs, sid, ltkGS, UAas,SACas, Ngs, EpLDACS, algo, Nas, tas, tgs, ~x)
+        , Out(<Nas, tgs, pk(ltkGS), sOCSPgs>)
+    ]
+
+// case a): AS already has the Certificate from GS
+rule AS_3_a:
+    let Z = tgs^y
+        Kag = kdf(Z,'s')
+        Km = kdf(Z,'m')
+        Ke = kdf(Z,'e')
+        mAS = hmac(<UAas, SACas, UAgs, SACgs>, Km)
+        sAS = sign(<algo, tas, Nas, Ngs, mAS>, ltkAS)     
+    in
+    [
+        S_AS_2(UAas, UAgs, SACgs, sid, ltkAS, mPubKeyGS, SACas, EpLDACS, Ngs, tas, y, Nas, algo)
+        , S_AS_has_cert(UAas, UAgs, sid)
+        , In(<Nas, tgs, not_used, sOCSPgs>) //drop the sent Cert
+        , !Pk(UAgs, pkGS) // use the Cert from the DB
+        , !PkCA(pkCA)
+    ]
+    --[ 
+        Eq(verify(sOCSPgs, <UAgs, pkGS>, pkCA), true)
+        , Knows(UAas, sid, Ke, UAgs)
+        , CheckA1(UAas, sid)
+    ]->
+    [ 
+        S_AS_3(UAas, UAgs, SACgs, sid, ltkAS, SACas, EpLDACS, Ngs, tas, tgs, y, Nas, algo, Z, Kag, Km, Ke, pkGS)
+        , Out(senc{sAS}Ke)
+        , !Sessk(UAas, Ke)
+    ]    
+
+// case b): AS does not have the Certificate from GS
+rule AS_3_b:
+    let Z = tgs^y
+        Kag = kdf(Z,'s')
+        Km = kdf(Z,'m')
+        Ke = kdf(Z,'e')
+        mAS = hmac(<UAas, SACas, UAgs, SACgs>, Km)
+        sAS = sign(<algo, tas, Nas, Ngs, mAS>, ltkAS)   
+    in
+    [
+        S_AS_2(UAas, UAgs, SACgs, sid, ltkAS, mPubKeyGS, SACas, EpLDACS, Ngs, tas, y, Nas, algo)
+        , S_AS_needs_cert(UAas, UAgs, sid)
+        , In(<Nas, tgs, pkGS, sOCSPgs>) //use the sent Cert
+        , !PkCA(pkCA)
+    ]
+    --[ 
+        Eq(h(pkGS), mPubKeyGS) //check the received Cert
+        , Eq(verify(sOCSPgs, <UAgs, pkGS>, pkCA), true)
+        , Knows(UAas, sid, Ke, UAgs)
+        , CheckA1(UAas, sid)
+    ]->
+    [ 
+        S_AS_3(UAas, UAgs, SACgs, sid, ltkAS, SACas, EpLDACS, Ngs, tas, tgs, y, Nas, algo, Z, Kag, Km, Ke, pkGS)
+        , Out(senc{sAS}Ke)
+        , !Sessk(UAas, Ke)
+    ]    
+
+
+rule GS_3:
+    let Z = tas^x
+        Kag = kdf(Z,'s')
+        Km = kdf(Z,'m')
+        Ke = kdf(Z,'e')
+        mAS = hmac(<UAas, SACas, UAgs, SACgs>, Km)
+
+        mGS = hmac(<UAgs, SACgs, UAas, SACas>, Km)
+        sGS = sign(<EpLDACS, 'CC_LDACS', tgs, tas, Ngs, Nas, mGS>, ltkGS)
+    in
+    [ 
+        S_GS_2(UAgs, SACgs, sid, ltkGS, UAas, SACas, Ngs, EpLDACS, algo, Nas, tas, tgs, x)
+        , !Pk(UAas, pkAS)
+        , In(senc{sAS}Ke)
+    ]
+    --[ 
+        Eq(verify(sAS, <algo, tas, Nas, Ngs, mAS>, pkAS), true)
+        , Running(UAgs, UAas, sid, tgs)
+        , Knows(UAgs, sid, Ke, UAas)
+    ]->
+    [
+        Out(senc{sGS}Ke)  
+        , S_GS_3(UAgs, SACgs, sid, ltkGS, UAas, SACas, Ngs, EpLDACS, algo, Nas, tas, tgs, x, Kag, Km, Ke)
+        , !Sessk(UAgs, Ke)
+    ]
+
+rule AS_4:
+    let mGS = hmac(<UAgs, SACgs, UAas, SACas>, Km)
+    in
+    [
+        S_AS_3(UAas, UAgs, SACgs, sid, ltkAS, SACas, EpLDACS, Ngs, tas, tgs, y, Nas, algo, Z, Kag, Km, Ke, pkGS)
+        , In(senc{sGS}Ke)
+        , Fr(~test1)
+    ]
+    --[ 
+        Eq(verify(sGS, <EpLDACS, 'CC_LDACS', tgs, tas, Ngs, Nas, mGS>, pkGS), true) // check the signature with the stored or received pkGS
+        , Commit(UAas, UAgs, sid, <tas, tgs>)
+        , Honest(UAas), Honest(UAgs) 
+    ]->
+    [ 
+        Out(<'Test', senc{UAgs, UAas, ~test1}Ke>)
+    ]
+
+rule GS_4:
+    [
+        S_GS_3(UAgs, SACgs, sid, ltkGS, UAas, SACas, Ngs, EpLDACS, algo, Nas, tas, tgs, x, Kag, Km, Ke)
+        , In(<'Test', senc{UAgs, UAas, test1}Ke>)
+    ]
+    --[ Commit(UAgs, UAas, sid, <tgs, tas>), Secret(Ke), Secret(test1), Honest(UAgs), Honest(UAas) ]->
+    []
+
+/////////////////////////////////////////////////////////////////////////////
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @i ==> x = y"
+
+restriction Inequality:
+    "All x #i. Neq(x,x) @ #i ==> F"
+
+restriction OnlyOnce:
+  "All #i #j. OnlyOnce()@#i & OnlyOnce()@#j ==> #i = #j"
+
+// rules which contain the OnlyOnceV(x)-event will be executed only once per x
+restriction OnlyOnceV:
+    "All #i #j x. OnlyOnceV(x)@#i & OnlyOnceV(x)@#j ==> #i = #j"
+
+
+// verify that the protocol runs through
+lemma executable_a:
+    exists-trace
+    "Ex A B ia ib x y #i #j #k #l #m #n #o #p #q. 
+        CreateA(A, ia)@i & CreateG(B, ib)@j & AttachingWCert(A, B, ia)@k
+           & Running(A, B, ia, x)@l & CheckG1(B, ib)@m & CheckA1(A, ia)@n
+           & Running(B, A, ib, y)@o
+           & Commit(A, B, ia, <x, y>)@p & Commit(B, A, ib, <y, x>)@q"
+
+lemma executable_b:
+    exists-trace
+    "Ex A B ia ib x y #i #j #k #l #m #n #o #p #q. 
+        CreateA(A, ia)@i & CreateG(B, ib)@j & AttachingNoCert(A, B, ia)@k
+           & Running(A, B, ia, x)@l & CheckG1(B, ib)@m & CheckA1(A, ia)@n
+           & Running(B, A, ib, y)@o
+           & Commit(A, B, ia, <x, y>)@p & Commit(B, A, ib, <y, x>)@q"
+
+
+// Perfect Forward Secrecy:
+// whenever a secret action Secret(x) occurs at timepoint i, 
+// the adversary does not know x 
+// or an agent claimed to be honest at time point i 
+// has been compromised at a timepoint r before
+// -> the point is: he needs to be compromised *before* 
+// -> if he was compromised *later* all older secrets still remain secret
+lemma secrecy:
+    "All x #i. 
+        Secret(x)@i ==> 
+            not (Ex #j. K(x)@j)
+            | (Ex B #r. Corrupted(B)@r & Honest(B)@i & #r<#i)"
+
+
+// If A finishes a run with B by exchanging y at time i
+// he can be sure, B also ran the protocol with A
+// and y has not been exchanged before in any other run (injective agreement)
+// the only exclusion is when a LTK has been compromised before
+lemma mutual_authentication:
+    "All A B x y ia #i. Commit(A, B, ia, <x, y>)@i ==> 
+            ( Ex ib #j. Running(B, A, ib, y)@j
+              & j<i
+              & not (Ex A2 B2 ia2 #i2. Commit(A2, B2, ia2, <x, y>)@i2 & not(#i2=#i))
+            )
+            | (Ex C #r. Corrupted(C)@r & Honest(C)@i & #r<#i)"
+
+
+// If A finishes a run with B it can be sure, that: 
+// * it has a session key P, and
+// * B also has this key as a session key with A (mutual understanding)
+// * the key is fresh and has not been exchanged before with any other agent, 
+// -> except the private key of an honest agent has been corrupted before
+lemma secure_key_establishment:
+    "All A B ia x #i. Commit(A, B, ia, x)@i ==> 
+            ( Ex P ib #j #m. Knows(A, ia, P, B)@m & Knows(B, ib, P, A)@j
+              & not (Ex D E id #k. Knows(D, id, P, E)@k & not(#m=#k) & not(#j=#k))
+            )
+            | (Ex C #r. Corrupted(C)@r & Honest(C)@i & #r<#i)"
+
+end
